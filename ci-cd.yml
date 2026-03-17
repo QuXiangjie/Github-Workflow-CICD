@@ -1,0 +1,256 @@
+# =============================================================================
+# GitHub Actions CI/CD Pipeline
+# =============================================================================
+# This workflow handles the full CI/CD lifecycle:
+#   1. Run tests
+#   2. Build Docker image and push to Amazon ECR
+#   3. Deploy to Staging (on develop branch push)
+#   4. Deploy to Production (on version tag push)
+#
+# Triggers:
+#   - Push to `develop` branch  → test → build → deploy to staging
+#   - Push of a version tag     → test → build → version guard → deploy to production
+#
+# Safety:
+#   - Production deployment includes a version guard that prevents deploying
+#     an older tag over a newer one (e.g., pushing v0.0.4 after v0.0.5).
+# =============================================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - develop                  # Triggers staging deployment
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+' # Triggers production deployment (e.g., v1.0.0)
+
+# ---------------------------------------------------------------------------
+# Job 1: Test
+# ---------------------------------------------------------------------------
+# Runs the test suite. All downstream jobs depend on this passing.
+# ---------------------------------------------------------------------------
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Add your test steps here, e.g.:
+      # - name: Install dependencies
+      #   run: npm install
+      # - name: Run tests
+      #   run: npm test
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Build and Push Docker Image to ECR
+  # ---------------------------------------------------------------------------
+  # Builds the Docker image and pushes it to Amazon ECR.
+  # - For version tags (e.g., v1.0.0): image is tagged with the version.
+  # - For develop branch commits: image is tagged with the commit SHA.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    needs: test                  # Only runs after tests pass
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Configure AWS CLI with credentials and region
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Authenticate Docker client with Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build, tag, and push the Docker image
+      # Tag strategy:
+      #   - Version tag push  → IMAGE_TAG = tag name (e.g., v1.0.0)
+      #   - Develop commit    → IMAGE_TAG = commit SHA
+      - name: Build, Tag, and Push to ECR
+        run: |
+          if [[ "${{ github.ref }}" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            IMAGE_TAG="${{ github.sha }}"
+          fi
+
+          docker build -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG .
+          docker push ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Deploy to Staging
+  # ---------------------------------------------------------------------------
+  # Deploys the Docker image (tagged with commit SHA) to the staging ECS
+  # environment. Only runs on pushes to the `develop` branch.
+  #
+  # Steps:
+  #   1. Fetch the current staging task definition from ECS
+  #   2. Update the container image in the task definition using jq
+  #   3. Register a new task definition revision
+  #   4. Update the ECS service to use the new revision
+  #   5. Wait for the service to stabilize
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    needs: build-and-push        # Only runs after image is pushed
+    if: github.ref == 'refs/heads/develop'   # Staging = develop branch only
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Configure AWS CLI with credentials and region
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Install jq for JSON manipulation of task definitions
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # Deploy the new image to ECS staging
+      - name: Deploy to ECS Staging
+        run: |
+          # 1. Retrieve the current ECS task definition for staging
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ${{ vars.ECS_TASK_DEFINITION_STAGING }})
+
+          # 2. Update the task definition:
+          #    - Set the container image to the new commit SHA tag
+          #    - Remove fields that are not allowed in register-task-definition
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}" \
+            '.taskDefinition |
+             .containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                 .compatibilities, .registeredAt, .registeredBy)')
+
+          # 3. Register a new revision of the task definition
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" | \
+            jq -r '.taskDefinition | .family + ":" + (.revision | tostring)')
+
+          # 4. Update the ECS service to use the new task definition revision
+          aws ecs update-service \
+            --cluster ${{ vars.ECS_CLUSTER_STAGING }} \
+            --service ${{ vars.ECS_SERVICE_STAGING }} \
+            --task-definition "$NEW_REVISION"
+
+          # 5. Wait for the service to reach a stable state
+          aws ecs wait services-stable \
+            --cluster ${{ vars.ECS_CLUSTER_STAGING }} \
+            --services ${{ vars.ECS_SERVICE_STAGING }}
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Deploy to Production
+  # ---------------------------------------------------------------------------
+  # Deploys the Docker image (tagged with version tag) to the production ECS
+  # environment. Only runs on version tag pushes (e.g., v1.0.0).
+  #
+  # Includes a VERSION GUARD that compares the incoming tag against the
+  # currently deployed version. If the incoming tag is older or equal,
+  # deployment is aborted to prevent accidental rollbacks.
+  #
+  # Same deployment steps as staging, but targets production resources.
+  # Manual tagging ensures only versioned and verified releases go live.
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    needs: build-and-push        # Only runs after image is pushed
+    if: startsWith(github.ref, 'refs/tags/v')   # Production = version tags only
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Configure AWS CLI with credentials and region
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Install jq for JSON manipulation of task definitions
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # -----------------------------------------------------------------------
+      # Version Guard: Prevent deploying an older version over a newer one.
+      # Fetches the currently running image tag from the production task
+      # definition, compares it with the incoming tag using semver sort,
+      # and aborts if the incoming tag is older or equal.
+      # -----------------------------------------------------------------------
+      - name: Verify version is newer than current production
+        run: |
+          INCOMING_TAG="${GITHUB_REF#refs/tags/}"
+
+          # Fetch the image tag currently running in production
+          CURRENT_IMAGE=$(aws ecs describe-task-definition \
+            --task-definition ${{ vars.ECS_TASK_DEFINITION_PRODUCTION }} \
+            | jq -r '.taskDefinition.containerDefinitions[0].image')
+
+          # Extract the version tag from the image URI (e.g., "v1.0.0" from "...ecr.../repo:v1.0.0")
+          CURRENT_TAG=$(echo "$CURRENT_IMAGE" | grep -oP 'v[\d.]+$' || echo "")
+
+          if [ -z "$CURRENT_TAG" ]; then
+            echo "No semver tag found on current production image. Proceeding with deployment."
+          else
+            # Use sort -V (version sort) to determine which tag is newer
+            NEWEST=$(printf '%s\n' "$CURRENT_TAG" "$INCOMING_TAG" | sort -V | tail -1)
+
+            if [ "$NEWEST" != "$INCOMING_TAG" ]; then
+              echo "::error::Incoming tag $INCOMING_TAG is older than current production tag $CURRENT_TAG. Aborting deployment."
+              exit 1
+            fi
+
+            if [ "$NEWEST" = "$CURRENT_TAG" ] && [ "$INCOMING_TAG" = "$CURRENT_TAG" ]; then
+              echo "::warning::Incoming tag $INCOMING_TAG is the same as current production tag. Skipping deployment."
+              exit 0
+            fi
+
+            echo "Version check passed: $CURRENT_TAG → $INCOMING_TAG"
+          fi
+
+      # Deploy the new image to ECS production
+      - name: Deploy to ECS Production
+        run: |
+          # Extract the version tag (e.g., v1.0.0)
+          IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+
+          # 1. Retrieve the current ECS task definition for production
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ${{ vars.ECS_TASK_DEFINITION_PRODUCTION }})
+
+          # 2. Update the task definition with the new versioned image
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG" \
+            '.taskDefinition |
+             .containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                 .compatibilities, .registeredAt, .registeredBy)')
+
+          # 3. Register a new revision of the task definition
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" | \
+            jq -r '.taskDefinition | .family + ":" + (.revision | tostring)')
+
+          # 4. Update the ECS service to use the new task definition revision
+          aws ecs update-service \
+            --cluster ${{ vars.ECS_CLUSTER_PRODUCTION }} \
+            --service ${{ vars.ECS_SERVICE_PRODUCTION }} \
+            --task-definition "$NEW_REVISION"
+
+          # 5. Wait for the service to reach a stable state
+          aws ecs wait services-stable \
+            --cluster ${{ vars.ECS_CLUSTER_PRODUCTION }} \
+            --services ${{ vars.ECS_SERVICE_PRODUCTION }}
